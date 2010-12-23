@@ -1,7 +1,7 @@
 from collections import defaultdict
 from django.db import models
 from django.contrib.auth.models import User
-from apps.rss_feeds.models import Feed, DuplicateFeed
+from apps.rss_feeds.models import Feed, DuplicateFeed, MStarredStory
 from apps.reader.models import UserSubscription, UserSubscriptionFolders
 from apps.rss_feeds.tasks import NewFeeds
 from celery.task import Task
@@ -13,6 +13,7 @@ from utils import log as logging
 from hashlib import md5
 from django.utils import simplejson
 import urllib, urllib2
+import zlib
 
 class OAuthToken(models.Model):
     user = models.OneToOneField(User, null=True, blank=True)
@@ -189,6 +190,7 @@ class FeverImporter(Importer):
         
         self.clear_feeds()
         folders = defaultdict(list)
+        feed_map = {}
         
         # Read feeds and groups first
         request = urllib2.urlopen(self.fever_url + "?api&groups&feeds", self.api_key_encoded)
@@ -214,7 +216,9 @@ class FeverImporter(Importer):
                     feed_data['num_subscribers'] = 1
                     feed_db, _ = Feed.objects.get_or_create(feed_address=feed_address,
                                                             defaults=dict(**feed_data))
-
+                
+                feed_map[feed["id"]] = feed_db.pk
+                
                 us, _ = UserSubscription.objects.get_or_create(
                     feed=feed_db, 
                     user=self.user,
@@ -233,12 +237,36 @@ class FeverImporter(Importer):
                     else:
                         category = "_Orphaned"
                     folders[category].append(feed_db.pk)
-                
-            # TODO: Import starred items
             
-            # Wrap up
             UserSubscriptionFolders.objects.get_or_create(user=self.user, defaults=dict(folders=json.encode([folders])))
-        
+            
+            # Import starred items
+            
+            request = urllib2.urlopen(self.fever_url + "?api&items", self.api_key_encoded)
+            data = simplejson.loads(request.read())
+            
+            while len(data.get("items", [])):
+                
+                for item in data["items"]:
+                    if item["is_saved"] == 1:
+                        story_values = dict(
+                            user_id = self.user.pk, 
+                            starred_date = datetime.datetime.fromtimestamp(item["created_on_time"]),
+                            story_date = datetime.datetime.fromtimestamp(item["created_on_time"]),
+                            story_author_name = item["author"],
+                            story_guid = "%s:%s:%s" % (item["feed_id"], item["id"], item["url"]),
+                            story_feed_id = feed_map[item["feed_id"]],
+                            story_permalink = item["url"],
+                            story_title = item["title"],
+                            story_content_z = zlib.compress(item["html"].encode("utf-8")),
+                            story_tags = []
+                        )
+                        
+                        MStarredStory.objects.create(**story_values)
+                
+                request = urllib2.urlopen(self.fever_url + "?api&items&since_id=" + str(item["id"]), self.api_key_encoded)
+                data = simplejson.loads(request.read())
+                
     
 
 def queue_new_feeds(user):
