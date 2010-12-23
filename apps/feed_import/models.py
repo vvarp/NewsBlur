@@ -194,46 +194,50 @@ class FeverImporter(Importer):
         request = urllib2.urlopen(self.fever_url + "?api&groups&feeds", self.api_key_encoded)
         data = simplejson.loads(request.read())
         
-        # Process groups/feeds
-        for feed in data["feeds"]:
-
-            feed_link = urlnorm.normalize(feed["site_url"])
-            feed_address = urlnorm.normalize(feed["url"])
-            
-            # See if it exists as a duplicate first
-            duplicate_feed = DuplicateFeed.objects.filter(duplicate_address=feed_address)
-            if duplicate_feed:
-                feed_db = duplicate_feed[0].feed
-            else:
-                feed_data = dict(feed_address=feed_address, feed_link=feed_link, feed_title=feed["title"])
-                feed_data['active_subscribers'] = 1
-                feed_data['num_subscribers'] = 1
-                feed_db, _ = Feed.objects.get_or_create(feed_address=feed_address,
-                                                        defaults=dict(**feed_data))
-
-            us, _ = UserSubscription.objects.get_or_create(
-                feed=feed_db, 
-                user=self.user,
-                defaults={
-                    'needs_unread_recalc': True,
-                    'active': self.user.profile.is_premium,
-                }
-            )
-            
-            if feed["is_spark"] == 1:
-                folders["_Sparks"].append(feed_db.pk)
-            else:
-                group_id = [k["group_id"] for k in data["feeds_groups"] if str(feed["id"]) in k["feed_ids"].split(",")]
-                if len(group_id):                    
-                    category = [k["title"] for k in data["groups"] if int(group_id[0]) == k["id"]][0]
-                else:
-                    category = "_Orphaned"
-                folders[category].append(feed_db.pk)
-                
-        # TODO: Import starred items
+        # Make sure API version is right
         
-        # Wrap up
-        UserSubscriptionFolders.objects.get_or_create(user=self.user, defaults=dict(folders=json.encode([folders])))
+        if data["api_version"] == 2:
+        
+            # Process groups/feeds
+            for feed in data["feeds"]:
+
+                feed_link = urlnorm.normalize(feed["site_url"])
+                feed_address = urlnorm.normalize(feed["url"])
+            
+                # See if it exists as a duplicate first
+                duplicate_feed = DuplicateFeed.objects.filter(duplicate_address=feed_address)
+                if duplicate_feed:
+                    feed_db = duplicate_feed[0].feed
+                else:
+                    feed_data = dict(feed_address=feed_address, feed_link=feed_link, feed_title=feed["title"])
+                    feed_data['active_subscribers'] = 1
+                    feed_data['num_subscribers'] = 1
+                    feed_db, _ = Feed.objects.get_or_create(feed_address=feed_address,
+                                                            defaults=dict(**feed_data))
+
+                us, _ = UserSubscription.objects.get_or_create(
+                    feed=feed_db, 
+                    user=self.user,
+                    defaults={
+                        'needs_unread_recalc': True,
+                        'active': self.user.profile.is_premium,
+                    }
+                )
+            
+                if feed["is_spark"] == 1:
+                    folders["_Sparks"].append(feed_db.pk)
+                else:
+                    group_id = [k["group_id"] for k in data["feeds_groups"] if str(feed["id"]) in k["feed_ids"].split(",")]
+                    if len(group_id):                    
+                        category = [k["title"] for k in data["groups"] if int(group_id[0]) == k["id"]][0]
+                    else:
+                        category = "_Orphaned"
+                    folders[category].append(feed_db.pk)
+                
+            # TODO: Import starred items
+            
+            # Wrap up
+            UserSubscriptionFolders.objects.get_or_create(user=self.user, defaults=dict(folders=json.encode([folders])))
         
     
 
