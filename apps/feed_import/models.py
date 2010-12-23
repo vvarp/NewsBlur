@@ -10,6 +10,9 @@ import lxml.etree
 from utils import json_functions as json, urlnorm
 import utils.opml as opml
 from utils import log as logging
+from hashlib import md5
+from django.utils import simplejson
+import urllib, urllib2
 
 class OAuthToken(models.Model):
     user = models.OneToOneField(User, null=True, blank=True)
@@ -172,7 +175,68 @@ class GoogleReaderImporter(Importer):
             else:
                 # folder_parents = folder.split(u' \u2014 ')
                 self.subscription_folders.append({folder: items})
-     
+
+
+class FeverImporter(Importer):
+    
+    def __init__(self, user, fever_url, fever_username, fever_password):
+        self.user = user
+        self.fever_url = fever_url
+        self.api_key_encoded = urllib.urlencode({"api_key": 
+                                    md5("%s:%s" % (fever_username, fever_password)).hexdigest()})
+    
+    def process(self):
+        
+        self.clear_feeds()
+        folders = defaultdict(list)
+        
+        # Read feeds and groups first
+        request = urllib2.urlopen(self.fever_url + "?api&groups&feeds", self.api_key_encoded)
+        data = simplejson.loads(request.read())
+        
+        # Process groups/feeds
+        for feed in data["feeds"]:
+
+            feed_link = urlnorm.normalize(feed["site_url"])
+            feed_address = urlnorm.normalize(feed["url"])
+            
+            # See if it exists as a duplicate first
+            duplicate_feed = DuplicateFeed.objects.filter(duplicate_address=feed_address)
+            if duplicate_feed:
+                feed_db = duplicate_feed[0].feed
+            else:
+                feed_data = dict(feed_address=feed_address, feed_link=feed_link, feed_title=feed["title"])
+                feed_data['active_subscribers'] = 1
+                feed_data['num_subscribers'] = 1
+                feed_db, _ = Feed.objects.get_or_create(feed_address=feed_address,
+                                                        defaults=dict(**feed_data))
+
+            us, _ = UserSubscription.objects.get_or_create(
+                feed=feed_db, 
+                user=self.user,
+                defaults={
+                    'needs_unread_recalc': True,
+                    'active': self.user.profile.is_premium,
+                }
+            )
+            
+            if feed["is_spark"] == 1:
+                folders["_Sparks"].append(feed_db.pk)
+            else:
+                group_id = [k["group_id"] for k in data["feeds_groups"] if str(feed["id"]) in k["feed_ids"].split(",")]
+                if len(group_id):                    
+                    category = [k["title"] for k in data["groups"] if int(group_id[0]) == k["id"]][0]
+                else:
+                    category = "_Orphaned"
+                folders[category].append(feed_db.pk)
+                
+        # TODO: Import starred items
+        
+        # Wrap up
+        UserSubscriptionFolders.objects.get_or_create(user=self.user, defaults=dict(folders=json.encode([folders])))
+        
+    
+
 def queue_new_feeds(user):
     new_feeds = UserSubscription.objects.filter(user=user, 
                                                 feed__fetched_once=False, 
