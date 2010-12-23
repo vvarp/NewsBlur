@@ -16,6 +16,8 @@ from django.db import IntegrityError
 from django.core.cache import cache
 from django.conf import settings
 from mongoengine.queryset import OperationError
+from apps.rss_feeds.tasks import UpdateFeeds
+from celery.task import Task
 from utils import json_functions as json
 from utils import feedfinder
 from utils.feed_functions import levenshtein_distance
@@ -41,7 +43,7 @@ class Feed(models.Model):
     has_feed_exception = models.BooleanField(default=False, db_index=True)
     has_page_exception = models.BooleanField(default=False, db_index=True)
     exception_code = models.IntegerField(default=0)
-    min_to_decay = models.IntegerField(default=15)
+    min_to_decay = models.IntegerField(default=0)
     days_to_trim = models.IntegerField(default=90)
     creation = models.DateField(auto_now_add=True)
     etag = models.CharField(max_length=255, blank=True, null=True)
@@ -85,6 +87,23 @@ class Feed(models.Model):
             # Feed has been deleted. Just ignore it.
             pass
     
+    @classmethod
+    def task_feeds(cls, feeds, queue_size=12):
+        print " ---> Tasking %s feeds..." % feeds.count()
+        
+        publisher = Task.get_publisher()
+
+        feed_queue = []
+        for f in feeds:
+            f.queued_date = datetime.datetime.utcnow()
+            f.set_next_scheduled_update()
+
+        for feed_queue in (feeds[pos:pos + queue_size] for pos in xrange(0, len(feeds), queue_size)):
+            feed_ids = [feed.pk for feed in feed_queue]
+            UpdateFeeds.apply_async(args=(feed_ids,), queue='update_feeds', publisher=publisher)
+
+        publisher.connection.close()
+
     def update_all_statistics(self):
         self.count_subscribers()
         self.count_stories()
@@ -353,7 +372,7 @@ class Feed(models.Model):
                         s.save()
                         ret_values[ENTRY_NEW] += 1
                         cache.set('updated_feed:%s' % self.id, 1)
-                    except (IntegrityError, OperationError), e:
+                    except (IntegrityError, OperationError):
                         ret_values[ENTRY_ERR] += 1
                         # logging.info('Saving new story, IntegrityError: %s - %s: %s' % (self.feed_title, story.get('title'), e))
                 elif existing_story and story_has_changed:
@@ -589,7 +608,11 @@ class Feed(models.Model):
             # print 'New/updated story: %s' % (story), 
         return story_in_system, story_has_changed
         
-    def get_next_scheduled_update(self):
+    def get_next_scheduled_update(self, force=False):
+        if self.min_to_decay and not force:
+            random_factor = random.randint(0, self.min_to_decay) / 4
+            return self.min_to_decay, random_factor
+            
         # Use stories per month to calculate next feed update
         updates_per_day = self.stories_last_month / 30.0
         # if updates_per_day < 1 and self.num_subscribers > 2:
@@ -632,11 +655,12 @@ class Feed(models.Model):
         return total, random_factor
         
     def set_next_scheduled_update(self):
-        total, random_factor = self.get_next_scheduled_update()
-
+        total, random_factor = self.get_next_scheduled_update(force=True)
+        
         next_scheduled_update = datetime.datetime.utcnow() + datetime.timedelta(
                                 minutes = total + random_factor)
             
+        self.min_to_decay = total
         self.next_scheduled_update = next_scheduled_update
 
         self.save()
